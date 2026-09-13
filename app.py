@@ -22,6 +22,47 @@ LOGIN_IMAGE = ASSETS / "patan_login_v4.png"
 SPLASH_IMAGE = ASSETS / "patan_portada.png"
 
 st.set_page_config(page_title="PATÁN · Control de Gestión", page_icon="🐾", layout="wide", initial_sidebar_state="expanded")
+
+# ============================================================
+# CONTROL DE FOCO / CURSOR · PATÁN WEB
+# Evita cursores de texto en zonas no editables.
+# ============================================================
+st.markdown("""
+<style>
+html, body,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stMainBlockContainer"],
+[data-testid="stSidebar"],
+div, section, header, footer,
+p, span, label, h1, h2, h3, h4, h5, h6 {
+    cursor: default;
+}
+
+input:not([type="button"]):not([type="submit"]):not([type="checkbox"]):not([type="radio"]),
+textarea {
+    cursor: text !important;
+}
+
+button,
+[role="button"],
+a,
+select,
+[data-baseweb="select"],
+input[type="checkbox"],
+input[type="radio"] {
+    cursor: pointer !important;
+}
+
+img,
+svg,
+canvas,
+[data-testid="stMetric"],
+[data-testid="stMarkdownContainer"] {
+    cursor: default;
+}
+</style>
+""", unsafe_allow_html=True)
 db.init_db()
 db.refresh_overdue_tasks()
 db.backup_database()
@@ -78,6 +119,40 @@ def login() -> None:
             key="patan_second_gate_pin",
         )
         enter = st.form_submit_button("→", type="primary")
+
+    # Foco automático exclusivamente en el campo PIN.
+    components.html(
+        """
+        <script>
+        (function () {
+            function focusPin() {
+                try {
+                    const doc = window.parent.document;
+                    const inputs = Array.from(
+                        doc.querySelectorAll('input[type="password"]')
+                    ).filter(el => !el.disabled && el.offsetParent !== null);
+
+                    if (inputs.length > 0) {
+                        const pin = inputs[0];
+                        if (doc.activeElement !== pin) {
+                            pin.focus({preventScroll: true});
+                            const len = pin.value.length;
+                            try {
+                                pin.setSelectionRange(len, len);
+                            } catch (e) {}
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            setTimeout(focusPin, 150);
+            setTimeout(focusPin, 400);
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
     if enter:
         user = db.authenticate(str(username), pin)
