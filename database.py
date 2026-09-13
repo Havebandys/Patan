@@ -6,6 +6,7 @@ import os
 import sqlite3
 import re
 import shutil
+import time
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,6 +14,14 @@ from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "patan.db"
+
+# Rendimiento WEB/Supabase: evita repetir trabajo remoto en cada rerun de Streamlit.
+_WEB_INIT_DONE = False
+_LAST_OVERDUE_REFRESH = 0.0
+_SETTINGS_CACHE: dict[str, Any] | None = None
+_SETTINGS_CACHE_AT = 0.0
+_ACTIVITY_TYPES_CACHE: dict[bool, tuple[float, list[dict[str, Any]]]] = {}
+
 
 
 def _database_url() -> str | None:
@@ -126,7 +135,11 @@ def verify_pin(pin: str, stored: str) -> bool:
 
 
 def init_db() -> None:
+    global _WEB_INIT_DONE
     # En web/Supabase la estructura se crea una sola vez desde SQL Editor.
+    # Streamlit reejecuta app.py con cada clic: no repetimos este sembrado remoto.
+    if _database_url() and _WEB_INIT_DONE:
+        return
     # Aquí sólo validamos/sembramos parámetros y usuarios base; local conserva SQLite.
     if _database_url():
         with get_conn() as conn:
@@ -148,6 +161,7 @@ def init_db() -> None:
                     conn.execute("UPDATE users SET pin_hash=? WHERE id=?",(_hash_pin("1234"),row["id"]))
             for name in ["REQUERIMIENTO","CÉDULA INTIMACIÓN","NOTA ELECTRÓNICA","ACTA","INFORME DE AVANCE","RESPUESTA DEL CONTRIBUYENTE","CIRCULARIZACIÓN","OTRA ACTUACIÓN"]:
                 conn.execute("INSERT INTO activity_types(name,active,is_custom) VALUES (?,1,0) ON CONFLICT(name) DO NOTHING",(name,))
+        _WEB_INIT_DONE = True
         return
     with get_conn() as conn:
         conn.executescript(
@@ -679,6 +693,7 @@ def list_activity_types(active_only: bool = True) -> list[dict[str, Any]]:
 
 
 def add_activity_type(name: str) -> int:
+    _ACTIVITY_TYPES_CACHE.clear()
     name = _upper_text(name)
     if not name:
         raise ValueError("Ingresá un nombre para la actividad.")
@@ -692,6 +707,10 @@ def add_activity_type(name: str) -> int:
 
 
 def fetch_settings() -> dict[str, Any]:
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_AT
+    now = time.monotonic()
+    if _database_url() and _SETTINGS_CACHE is not None and now - _SETTINGS_CACHE_AT < 30:
+        return dict(_SETTINGS_CACHE)
     with get_conn() as conn:
         rows = conn.execute("SELECT key,value FROM settings").fetchall()
     out: dict[str, Any] = {}
@@ -701,10 +720,16 @@ def fetch_settings() -> dict[str, Any]:
             out[row["key"]] = float(value) if "." in value else int(value)
         except ValueError:
             out[row["key"]] = value
+    if _database_url():
+        _SETTINGS_CACHE = dict(out)
+        _SETTINGS_CACHE_AT = now
     return out
 
 
 def save_settings(values: dict[str, Any]) -> None:
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_AT
+    _SETTINGS_CACHE = None
+    _SETTINGS_CACHE_AT = 0.0
     with get_conn() as conn:
         for key, value in values.items():
             conn.execute(
@@ -966,10 +991,16 @@ def update_task_status(task_id: int, status: str, actor_user_id: int | None = No
 
 
 def refresh_overdue_tasks() -> None:
+    global _LAST_OVERDUE_REFRESH
+    now = time.monotonic()
+    if _database_url() and _LAST_OVERDUE_REFRESH and now - _LAST_OVERDUE_REFRESH < 60:
+        return
     today=datetime.now().strftime('%Y-%m-%d')
     with get_conn() as conn:
         conn.execute("UPDATE case_tasks SET status='VENCIDA', updated_at=CURRENT_TIMESTAMP WHERE status='PENDIENTE' AND due_date IS NOT NULL AND due_date < ?", (today,))
         conn.execute("UPDATE case_tasks SET status='PENDIENTE', updated_at=CURRENT_TIMESTAMP WHERE status='VENCIDA' AND (due_date IS NULL OR due_date >= ?)", (today,))
+    if _database_url():
+        _LAST_OVERDUE_REFRESH = now
 
 
 def suspend_case(case_id: int, actor_user_id: int | None = None) -> None:
