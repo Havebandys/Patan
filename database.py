@@ -71,7 +71,7 @@ def get_conn():
     url = _database_url()
     if url:
         import psycopg
-        conn = psycopg.connect(url, autocommit=False)
+        conn = psycopg.connect(url, autocommit=False, prepare_threshold=None)
         wrapper = _PGCompat(conn)
         try:
             yield wrapper
