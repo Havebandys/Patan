@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 import sqlite3
+import re
 import shutil
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -14,17 +15,82 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "patan.db"
 
 
+def _database_url() -> str | None:
+    url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
+    if url:
+        return url
+    try:
+        import streamlit as st
+        return st.secrets.get("DATABASE_URL") or st.secrets.get("SUPABASE_DB_URL")
+    except Exception:
+        return None
+
+
+def _pg_sql(sql: str) -> str:
+    sql = re.sub(r"\s+COLLATE\s+NOCASE", "", sql, flags=re.I)
+    sql = sql.replace("?", "%s")
+    return sql
+
+
+class _PGResult:
+    def __init__(self, cursor, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+    def fetchone(self): return self._cursor.fetchone()
+    def fetchall(self): return self._cursor.fetchall()
+
+
+class _PGCompat:
+    _ID_TABLES = {"users","cases","movements","meetings","activity_types","case_tasks","audit_log","login_log","rectifications","suggestions","news"}
+    def __init__(self, conn): self._conn = conn
+    def execute(self, sql: str, params=()):
+        from psycopg.rows import dict_row
+        q = _pg_sql(sql.strip())
+        ignore = bool(re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO", q, re.I))
+        if ignore:
+            q = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", q, flags=re.I)
+            q += " ON CONFLICT DO NOTHING"
+        m = re.match(r"^INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)", q, re.I)
+        wants_id = bool(m and m.group(1).lower() in self._ID_TABLES and "RETURNING" not in q.upper() and not ignore)
+        if wants_id: q += " RETURNING id"
+        cur = self._conn.cursor(row_factory=dict_row)
+        cur.execute(q, params)
+        lastrowid = None
+        if wants_id:
+            row = cur.fetchone()
+            lastrowid = row["id"] if row else None
+        return _PGResult(cur, lastrowid)
+    def executescript(self, script: str):
+        cur = self._conn.cursor()
+        cur.execute(script)
+        return _PGResult(cur)
+
+
 @contextmanager
 def get_conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    url = _database_url()
+    if url:
+        import psycopg
+        conn = psycopg.connect(url, autocommit=False)
+        wrapper = _PGCompat(conn)
+        try:
+            yield wrapper
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
 
 
@@ -36,7 +102,10 @@ def _upper_text(value: Any) -> Any:
     if isinstance(value, str):
         return value.strip().upper()
     return value
-def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+def _column_exists(conn, table: str, column: str) -> bool:
+    if isinstance(conn, _PGCompat):
+        row = conn.execute("SELECT 1 AS ok FROM information_schema.columns WHERE table_schema='public' AND table_name=? AND column_name=?", (table, column)).fetchone()
+        return bool(row)
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(r["name"] == column for r in rows)
 
@@ -57,6 +126,29 @@ def verify_pin(pin: str, stored: str) -> bool:
 
 
 def init_db() -> None:
+    # En web/Supabase la estructura se crea una sola vez desde SQL Editor.
+    # Aquí sólo validamos/sembramos parámetros y usuarios base; local conserva SQLite.
+    if _database_url():
+        with get_conn() as conn:
+            defaults = {
+                "yellow_inactivity_days":"15","red_inactivity_days":"30","yellow_deadline_pct":"70",
+                "red_deadline_pct":"90","yellow_progress_days":"45","progress_interval_days":"60",
+                "standard_objective_days":"180","complex_objective_days":"365","preliminary_business_days":"5",
+                "first_request_business_days":"10","final_report_business_days":"10","active_cases_target":"5",
+                "password_expiry_days":"90","inactive_user_alert_days":"90"}
+            for key,value in defaults.items():
+                conn.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING", (key,value))
+            bad_carlos = "00112233445566778899aabbccddeeff$4e94476e7793ccf66fddcbc373716c3559e5c1ea0126ca6d916378efe3a4dc80"
+            bad_adm = "ffeeddccbbaa99887766554433221100$7961ef49749fb16498e308f2b64bd3f96c3c600522809d2be899057be3ad0bdf"
+            for username,display,role,jur,agent,bad in [("CARLOS","CARLOS FREYBERGUER","USUARIO","RIO GRANDE",1,bad_carlos),("ADM","PATÁN","ADMIN","SISTEMA",0,bad_adm)]:
+                row=conn.execute("SELECT id,pin_hash FROM users WHERE UPPER(username)=?",(username,)).fetchone()
+                if not row:
+                    conn.execute("INSERT INTO users(username,display_name,pin_hash,role,active,jurisdiction,is_agent,must_change_password,password_changed_at) VALUES (?,?,?,?,1,?,?,1,CURRENT_TIMESTAMP)",(username,display,_hash_pin("1234"),role,jur,agent))
+                elif row.get("pin_hash") == bad:
+                    conn.execute("UPDATE users SET pin_hash=? WHERE id=?",(_hash_pin("1234"),row["id"]))
+            for name in ["REQUERIMIENTO","CÉDULA INTIMACIÓN","NOTA ELECTRÓNICA","ACTA","INFORME DE AVANCE","RESPUESTA DEL CONTRIBUYENTE","CIRCULARIZACIÓN","OTRA ACTUACIÓN"]:
+                conn.execute("INSERT INTO activity_types(name,active,is_custom) VALUES (?,1,0) ON CONFLICT(name) DO NOTHING",(name,))
+        return
     with get_conn() as conn:
         conn.executescript(
             """
@@ -910,6 +1002,8 @@ def close_case_checked(case_id: int, user_id: int, reason: str, result: str, not
 
 
 def backup_database() -> str | None:
+    if _database_url():
+        return None
     if not DB_PATH.exists():
         return None
     bdir=BASE_DIR/'data'/'backups'; bdir.mkdir(parents=True,exist_ok=True)
